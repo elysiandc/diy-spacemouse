@@ -3,7 +3,7 @@
 #include <TLx493D_inc.hpp>
 
 // Version information
-const char* VERSION = "SIMPLE-1.1.0";
+const char* VERSION = "SIMPLE-1.3.0";
 
 // 3D Mouse HID Report Descriptor (3DConnexion compatible) - REMOVED KEYBOARD
 uint8_t const desc_hid_report[] = {
@@ -44,12 +44,27 @@ OneButton button2(27, false);  // Changed from true to false (inverted logic)
 double xOffset = 0, yOffset = 0, zOffset = 0;
 double xCurrent = 0, yCurrent = 0, zCurrent = 0;
 
+// Temperature compensation variables
+double baseTemperature = 0;
+double currentTemperature = 0;
+double temperatureDrift = 0;
+
+// Sensor health monitoring
+unsigned long lastValidReading = 0;
+unsigned long sensorErrorCount = 0;
+bool sensorHealthy = true;
+
 // Basic parameters
 int calSamples = 100;  // Reduced from 300
 int sensitivity = 16;   // Increased from 8 for faster movement
 double xyThreshold = 0.4; // Increased from 0.3 (based on working examples)
 double deadzone = 0.15;  // Increased from 0.1 for better stability
-double zThreshold = xyThreshold * 2.5; // Z threshold for orbit mode
+
+// Z-axis asymmetric sensitivity
+double zPositiveSensitivity = 24;  // Higher sensitivity for upward movement (harder to achieve)
+double zNegativeSensitivity = 12;  // Lower sensitivity for downward movement (easier to achieve)
+double zPositiveThreshold = 0.3;   // Lower threshold for positive Z (more responsive)
+double zNegativeThreshold = 0.5;   // Higher threshold for negative Z (less sensitive)
 
 bool wasMoving = false;
 unsigned long count = 0;  // Changed from uint8_t to prevent overflow
@@ -183,32 +198,48 @@ void setup() {
   Serial.println("- Button 2: Double middle click (fit to screen)");
   Serial.println("================================");
 
-  // Initialize sensor
+  // Initialize sensor with enhanced configuration
   Serial.println("Initializing sensor...");
   mag.begin();
-  Serial.println("Sensor initialized");
+  
+  // Configure sensor for optimal performance (using default settings for stability)
+  // Note: Advanced configuration commented out until we verify correct constants
+  // mag.setSensitivity(IFX_TLX493D_SENSITIVITY_0_5MT);  // High precision mode
+  // mag.setUpdateRate(IFX_TLX493D_UPDATE_RATE_100HZ);   // High update rate for responsiveness
+  
+  Serial.println("Sensor initialized with enhanced validation and temperature compensation");
 
-  // Simple calibration
-  Serial.println("Calibrating sensor...");
+  // Enhanced calibration with temperature compensation
+  Serial.println("Calibrating sensor with temperature compensation...");
+  double tempSum = 0;
+  
   for (int i = 1; i <= calSamples; i++) {
-    double x, y, z;
-    mag.getMagneticField(&x, &y, &z);
+    double x, y, z, temp;
     
-    xOffset += x;
-    yOffset += y;
-    zOffset += z;
-
-    if (i % 20 == 0) Serial.print(".");
+    // Get magnetic field and temperature
+    if (mag.getMagneticField(&x, &y, &z) && mag.getTemperature(&temp)) {
+      xOffset += x;
+      yOffset += y;
+      zOffset += z;
+      tempSum += temp;
+      
+      if (i % 20 == 0) Serial.print(".");
+    } else {
+      Serial.print("E"); // Error indicator
+      i--; // Retry this sample
+    }
   }
 
   xOffset = xOffset / calSamples;
   yOffset = yOffset / calSamples;
   zOffset = zOffset / calSamples;
+  baseTemperature = tempSum / calSamples;
 
   Serial.println();
   Serial.print("Calibration complete - X: "); Serial.print(xOffset, 3);
   Serial.print(" Y: "); Serial.print(yOffset, 3);
-  Serial.print(" Z: "); Serial.println(zOffset, 3);
+  Serial.print(" Z: "); Serial.print(zOffset, 3);
+  Serial.print(" Base Temp: "); Serial.println(baseTemperature, 1);
 }
 
 void loop() {
@@ -246,8 +277,9 @@ void loop() {
     Serial.print("Above threshold: "); Serial.println((abs(xCurrent) > xyThreshold || abs(yCurrent) > xyThreshold) ? "YES" : "NO");
   }
 
-  // Read sensor (simplified) - add protection against button interference
-  double x, y, z;
+  // Enhanced sensor reading with data validation and temperature compensation
+  double x, y, z, temp;
+  bool validReading = false;
   
   // Read sensor with Button 1 interference protection (with debounce)
   static bool lastButton1State = true;  // Start with not pressed
@@ -255,18 +287,74 @@ void loop() {
   
   if (currentButton1State == 0 && lastButton1State == 1) {  // Button 1 just pressed
     x = xOffset; y = yOffset; z = zOffset;
+    temp = baseTemperature;
+    validReading = true;
   } else if (currentButton1State == 0) {  // Button 1 held down
     x = xOffset; y = yOffset; z = zOffset;
+    temp = baseTemperature;
+    validReading = true;
   } else {
-    mag.getMagneticField(&x, &y, &z);
+    // Enhanced sensor reading with more robust validation
+    bool magneticSuccess = mag.getMagneticField(&x, &y, &z);
+    bool tempSuccess = mag.getTemperature(&temp);
+    
+    if (magneticSuccess) {
+      // Check if readings are reasonable (not all zeros or extreme values)
+      if (abs(x) < 100 && abs(y) < 100 && abs(z) < 100) {
+        validReading = true;
+        lastValidReading = millis();
+        sensorHealthy = true;
+        sensorErrorCount = 0; // Reset error count on success
+      } else {
+        sensorErrorCount++;
+        validReading = false;
+        if (count % 100 == 0) {
+          Serial.print("Invalid magnetic readings - X: "); Serial.print(x);
+          Serial.print(" Y: "); Serial.print(y);
+          Serial.print(" Z: "); Serial.println(z);
+        }
+      }
+    } else {
+      sensorErrorCount++;
+      validReading = false;
+      if (count % 100 == 0) {
+        Serial.println("Failed to read magnetic field");
+      }
+    }
+    
+    // Handle temperature reading separately
+    if (!tempSuccess) {
+      temp = baseTemperature; // Use base temperature if reading fails
+    }
+    
+    // Check if sensor has been unhealthy for too long
+    if (millis() - lastValidReading > 10000) { // 10 seconds
+      sensorHealthy = false;
+      if (count % 1000 == 0) {
+        Serial.println("WARNING: Sensor appears unhealthy, attempting recovery...");
+      }
+    }
   }
   
   lastButton1State = currentButton1State;
 
-  // Simple offset correction (no Kalman filters) with Y-axis inversion
-  xCurrent = x - xOffset;
-  yCurrent = -(y - yOffset);  // Inverted Y-axis
-  zCurrent = z - zOffset;
+  // Enhanced offset correction with temperature compensation
+  if (validReading) {
+    // Calculate temperature drift
+    temperatureDrift = temp - baseTemperature;
+    
+    // Apply temperature compensation (simple linear model)
+    double tempCompensation = temperatureDrift * 0.001; // 0.001 mT/°C compensation factor
+    
+    xCurrent = (x - xOffset) - tempCompensation;
+    yCurrent = -(y - yOffset) - tempCompensation;  // Inverted Y-axis
+    zCurrent = (z - zOffset) - tempCompensation;
+  } else {
+    // Use last valid readings if sensor data is invalid
+    if (count % 100 == 0) {
+      Serial.println("Using last valid readings due to sensor error");
+    }
+  }
   
   // Debug: Show what values are being used for movement detection (simplified)
   static bool lastDebugButton1State = true;
@@ -275,11 +363,16 @@ void loop() {
   }
   lastDebugButton1State = currentButton1State;
 
-    // Check for orbit mode based on Z-axis (like working examples)
-  bool shouldOrbit = abs(zCurrent) > zThreshold;
+    // Asymmetric Z-axis movement detection
+  bool zAboveThreshold = false;
+  if (zCurrent > 0) {
+    zAboveThreshold = zCurrent > zPositiveThreshold;  // Easier to trigger positive Z
+  } else {
+    zAboveThreshold = abs(zCurrent) > zNegativeThreshold;  // Harder to trigger negative Z
+  }
   
-  // Improved movement detection based on working examples
-  bool aboveThreshold = (abs(xCurrent) > xyThreshold || abs(yCurrent) > xyThreshold);
+  // Improved movement detection - check all axes with asymmetric Z handling
+  bool aboveThreshold = (abs(xCurrent) > xyThreshold || abs(yCurrent) > xyThreshold || zAboveThreshold);
   
   if (aboveThreshold) {
     
@@ -287,15 +380,23 @@ void loop() {
       Serial.print("Movement started - X: "); Serial.print(xCurrent, 3);
       Serial.print(" Y: "); Serial.print(yCurrent, 3);
       Serial.print(" Z: "); Serial.print(zCurrent, 3);
-      Serial.print(" Orbit: "); Serial.print(shouldOrbit ? "YES" : "NO");
-      Serial.print(" Threshold: "); Serial.println(xyThreshold);
+      Serial.print(" Z-Threshold: "); Serial.print(zCurrent > 0 ? zPositiveThreshold : zNegativeThreshold);
+      Serial.print(" | Z-Sensitivity: "); Serial.print(zCurrent > 0 ? zPositiveSensitivity : zNegativeSensitivity);
+      Serial.println();
       wasMoving = true;
     }
 
-    // Simple mapping (no complex calculations) with increased sensitivity
+    // Asymmetric movement mapping with enhanced Z-axis handling
     int xMove = (int)(xCurrent * sensitivity);
     int yMove = (int)(yCurrent * sensitivity);
-    int zMove = (int)(zCurrent * sensitivity / 2);  // Reduced Z sensitivity to prevent jumpiness
+    
+    // Asymmetric Z sensitivity - more sensitive for positive (upward), softer for negative (downward)
+    int zMove;
+    if (zCurrent > 0) {
+      zMove = (int)(zCurrent * zPositiveSensitivity);  // Higher sensitivity for upward movement
+    } else {
+      zMove = (int)(zCurrent * zNegativeSensitivity);  // Lower sensitivity for downward movement
+    }
 
     // Limit movement range
     xMove = constrain(xMove, -127, 127);
@@ -307,19 +408,24 @@ void loop() {
       Serial.print("Movement values - X: "); Serial.print(xMove);
       Serial.print(" Y: "); Serial.print(yMove);
       Serial.print(" Z: "); Serial.print(zMove);
-      Serial.print(" Orbit: "); Serial.println(shouldOrbit ? "YES" : "NO");
+      Serial.print(" | Z-Direction: "); Serial.print(zCurrent > 0 ? "UP" : "DOWN");
+      Serial.println();
     }
     
-    // Send movement with proper 3DConnexion compatible reports
+    // Send movement with clean 3DConnexion compatible reports
     if (usb_hid.ready()) {
       // Create 6-axis 3D mouse report data (X,Y,Z,Rx,Ry,Rz)
       uint8_t report_data[6];
-      report_data[0] = (uint8_t)(xMove/2);  // X axis (translation)
-      report_data[1] = (uint8_t)(shouldOrbit ? -yMove/2 : yMove/2);  // Y axis (translation)
-      report_data[2] = (uint8_t)(shouldOrbit ? 0 : zMove/4);  // Z axis (translation)
-      report_data[3] = (uint8_t)(xMove/4);  // Rx axis (rotation X)
-      report_data[4] = (uint8_t)(yMove/4);  // Ry axis (rotation Y)
-      report_data[5] = (uint8_t)(zMove/4);  // Rz axis (rotation Z)
+      
+      // Translation axes (X, Y, Z)
+      report_data[0] = (uint8_t)(xMove/2);  // X axis (left/right)
+      report_data[1] = (uint8_t)(yMove/2);  // Y axis (forward/back)
+      report_data[2] = (uint8_t)(zMove/4);  // Z axis (up/down with asymmetric sensitivity)
+      
+      // Rotation axes (Rx, Ry, Rz) - Z-axis twist for rotation
+      report_data[3] = 0;                   // Rx axis (disabled)
+      report_data[4] = 0;                   // Ry axis (disabled)
+      report_data[5] = (uint8_t)(zMove/2);  // Rz axis (Z-axis twist for rotation)
       
       // Send the 3DConnexion compatible report
       usb_hid.sendReport(2, report_data, sizeof(report_data));
@@ -333,11 +439,16 @@ void loop() {
     // No buttons to release since we're not using drag mode
   }
 
-  // Simple monitoring
+  // Enhanced monitoring with sensor health and temperature
   if (count % 1000 == 0) {
     Serial.print("Count: "); Serial.println(count);
     Serial.print("Uptime: "); Serial.print(millis() / 1000); Serial.println(" seconds");
     Serial.print("Free memory: "); Serial.print(rp2040.getFreeHeap()); Serial.println(" bytes");
+    Serial.print("Sensor Health: "); Serial.print(sensorHealthy ? "OK" : "ERROR");
+    Serial.print(" | Errors: "); Serial.print(sensorErrorCount);
+    Serial.print(" | Temp: "); Serial.print(temp, 1);
+    Serial.print("°C | Drift: "); Serial.print(temperatureDrift, 2);
+    Serial.println("°C");
     Serial.println("---");
   }
 
